@@ -1,0 +1,34 @@
+[project]
+name = "assetops"
+version = "0.1.0"
+description = "玄鸟 AssetOps — 面向明确授权目标的 AI 资产收集与分析智能体"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "AssetOps Team" }]
+license = { text = "MIT" }
+dependencies = [
+    "fastmcp>=0.2.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.7.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[project.scripts]
+assetops = "assetops.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["assetops"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
