@@ -93,7 +93,7 @@
 
 ## 验证步骤
 
-1. 扩展已有 `tests/test_httpx_probe.py`、`tests/test_scope_guard.py`；为评分、主动传输、枚举、入口及信号增加必要测试。全部用 fixtures、假解析器、假连接器、假 subprocess，无真实网络。
+1. 扩展已有 `tests/spec_httpx_probe.py`、`tests/spec_scope_guard.py`；为评分、主动传输、枚举、入口及信号增加必要测试。全部用 fixtures、假解析器、假连接器、假 subprocess，无真实网络。
 2. 评分固定样本覆盖所有源规则优先顺序、五维分数、最高97、35/60边界、未知数据、Top20、重复运行及跨Run隔离。
 3. 指纹测试覆盖负数favicon、字段别名、无效/全零JARM、缺工具/不支持版本、禁止参数、范围外favicon、输出污染、预算不足与关系刷新。
 4. 主动边界覆盖域名排除、IP未授权、DNS重绑定、IPv6、多地址、特殊地址、禁止路径、重定向不跟随、HTTPS SNI、TLS失败、响应大小、超时、429/503、基线与重试计预算、跨步骤/重复调用预算和并发预留；越界必须零连接。

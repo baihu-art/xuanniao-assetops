@@ -31,4 +31,5 @@ packages = ["assetops"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+python_files = ["spec_*.py"]
 asyncio_mode = "auto"

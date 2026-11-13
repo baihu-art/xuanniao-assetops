@@ -45,7 +45,7 @@ Copy-Item .env.example .env
 Copy-Item scope.example.json scope.json
 ```
 
-编辑 `.env`，至少确认：
+编辑 `.env`，至少确认基础项：
 
 ```dotenv
 ASSETOPS_DATA_ROOT=./data
@@ -53,7 +53,39 @@ ASSETOPS_SCOPE_FILE=./scope.json
 ASSETOPS_TIMEOUT=30
 ASSETOPS_RATE_LIMIT=5
 ASSETOPS_BUDGET_MAX=10000
+ASSETOPS_INSECURE_TLS=0
 ```
+
+`ASSETOPS_INSECURE_TLS` 默认为 `0`，仅在受控测试环境中针对自签名证书的授权目标临时开启。
+
+### Provider 凭据
+
+只有填入对应凭据的 Provider 才会实际发起查询，其余步骤标记为 `skipped`：
+
+```dotenv
+FOFA_EMAIL=your_email@example.com
+FOFA_KEY=your_fofa_api_key
+QUAKE_TOKEN=your_quake_token
+HUNTER_KEY=your_hunter_api_key
+SHODAN_KEY=your_shodan_api_key
+```
+
+### 被动 JSON 接口（可选）
+
+除内置 Provider 外，还可以接入 DNS、CT、WHOIS、ASN 的被动 JSON 接口。不填写对应的 `*_ENDPOINT` 时该 Provider 不启用：
+
+```dotenv
+PASSIVE_DNS_ENDPOINT=
+PASSIVE_DNS_KEY=
+CT_ENDPOINT=
+CT_KEY=
+WHOIS_ENDPOINT=
+WHOIS_KEY=
+ASN_ENDPOINT=
+ASN_KEY=
+```
+
+DNS 与 CT 的 KEY 可选；WHOIS 与 ASN 必须同时提供 `ENDPOINT` 和 `KEY` 才会被识别为已配置。KEY 以 `Authorization: Bearer` 形式发送。
 
 将实际授权目标写入 `scope.json`。例如：
 
@@ -184,7 +216,16 @@ assetops subdomain-brute <RUN_ID> example.com --wordlist ./small-wordlist.txt
 
 候选会逐条进行授权校验；HTTP 验证必须通过 `--verify-http` 显式开启。请不要对未授权目标使用大字典或高并发。
 
-主动限额由 `ASSETOPS_ACTIVE_*` 配置控制，包括速率、超时、每步连接数、响应读取上限和并发。限额不能超过 Run 的剩余主动预算。
+主动限额由以下变量控制，括号内为默认值；任一值必须为正，实际用量不得超过 Run 的剩余主动预算：
+
+```dotenv
+ASSETOPS_ACTIVE_RATE_LIMIT=2               # 每秒最多请求数
+ASSETOPS_ACTIVE_MAX_REQUESTS=100           # 每步最多连接尝试
+ASSETOPS_ACTIVE_TIMEOUT=10                 # 单次连接超时（秒）
+ASSETOPS_ACTIVE_MAX_RESPONSE_BYTES=262144  # 单个响应读取上限（256 KiB）
+```
+
+主动步骤当前串行执行，不提供并发配置项。
 
 ## 五维评分
 
