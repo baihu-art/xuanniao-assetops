@@ -30,6 +30,6 @@ build-backend = "hatchling.build"
 packages = ["assetops"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["spec"]
 python_files = ["spec_*.py"]
 asyncio_mode = "auto"
