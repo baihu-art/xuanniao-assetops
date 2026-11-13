@@ -203,6 +203,42 @@ def list_assets(
     return result
 
 
+def load_run_assets(db: Database, run_id: str) -> list[Asset]:
+    """加载本 Run 的观测，分页读取资产，避免跨 Run 证据混入。"""
+    assets: list[Asset] = []
+    offset = 0
+    while True:
+        page = list_assets(db, run_id=run_id, limit=200, offset=offset)
+        if not page:
+            break
+        for asset in page:
+            rows = db.fetch_all(
+                "SELECT * FROM observations WHERE asset_id=? AND run_id=? ORDER BY last_seen_at, id",
+                (asset.id, run_id),
+            )
+            asset.observations = [Observation(
+                id=r["id"], run_id=r["run_id"], source=r["source"],
+                confidence=r["confidence"], evidence=json.loads(r["evidence_json"]),
+                first_seen_at=r["first_seen_at"], last_seen_at=r["last_seen_at"],
+            ) for r in rows]
+            assets.append(asset)
+        offset += len(page)
+    return assets
+
+
+def reserve_active_budget(db: Database, run_id: str, amount: int) -> None:
+    if amount < 1:
+        raise ValueError("reservation must be positive")
+    db.execute("INSERT OR IGNORE INTO active_budgets(run_id,used) VALUES (?,0)", (run_id,))
+    cursor = db.execute(
+        "UPDATE active_budgets SET used=used+? WHERE run_id=? "
+        "AND used+? <= (SELECT budget_max FROM runs WHERE id=?)",
+        (amount, run_id, amount, run_id),
+    )
+    if cursor.rowcount != 1:
+        raise RuntimeError("active budget exhausted")
+
+
 def count_assets(
     db: Database,
     *,

@@ -13,6 +13,13 @@ from typing import Iterator
 
 
 TABLES_DDL = """
+CREATE TABLE IF NOT EXISTS active_budgets (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    used INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS active_run_locks (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS runs (
     id              TEXT PRIMARY KEY,
     name            TEXT NOT NULL DEFAULT '',

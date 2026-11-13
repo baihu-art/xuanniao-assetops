@@ -91,7 +91,7 @@ def cmd_httpx(args) -> int:
         print("[error] 未检测到授权范围配置。", file=sys.stderr)
         return 1
     try:
-        run = mgr.execute_httpx(args.run_id)
+        run = mgr.execute_httpx(args.run_id, favicon=args.favicon, jarm=args.jarm)
     except (ValueError, RuntimeError) as exc:
         print(f"[error] {exc}", file=sys.stderr)
         return 1
@@ -152,40 +152,49 @@ def cmd_runs(args) -> int:
 
 
 def cmd_export_report(args) -> int:
-    from datetime import datetime, timezone
+    from assetops.analysis.signals import export_report
     mgr, config, _ = _setup()
-    report_dir = Path(config.data_root) / "reports"
-    report_dir.mkdir(parents=True, exist_ok=True)
-    assets = list_assets(mgr._db, run_id=args.run_id, limit=50000)
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-    if args.format == "json":
-        path = report_dir / f"report-{ts}.json"
-        path.write_text(json.dumps({
-            "run_id": args.run_id, "generated_at": ts,
-            "total_assets": len(assets),
-            "assets": [a.to_dict() for a in assets],
-        }, ensure_ascii=False, indent=2), encoding="utf-8")
-    elif args.format == "markdown":
-        path = report_dir / f"report-{ts}.md"
-        lines = [
-            "# 玄鸟 AssetOps 资产报告", "",
-            f"- 生成时间：{ts}", f"- Run ID：{args.run_id or '(全部)'}",
-            f"- 资产总数：{len(assets)}", "",
-            "## 资产列表", "",
-            "| 优先级 | Host | IP:Port | 标题 | Server | 来源 |",
-            "|--------|------|---------|------|--------|------|",
-        ]
-        for a in sorted(assets, key=lambda x: (x.priority != "high", x.host)):
-            sources = ", ".join(sorted(a.sources))
-            lines.append(f"| {a.priority} | {a.host} | {a.ip}:{a.port} | {a.title} | {a.server} | {sources} |")
-        path.write_text("\n".join(lines), encoding="utf-8")
-    else:
-        print(f"[error] unsupported format: {args.format}", file=sys.stderr)
+    try:
+        result = export_report(mgr._db, config.data_root, args.run_id, args.format)
+    except ValueError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
         return 1
-
-    print(f"[assetops] report -> {path}  ({len(assets)} assets)")
+    print(json.dumps(result, ensure_ascii=False))
     return 0
+
+
+def cmd_export_signals(args) -> int:
+    from assetops.analysis.signals import export_signals
+    mgr, config, _ = _setup()
+    try:
+        result = export_signals(mgr._db, config.data_root, args.run_id)
+    except ValueError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def cmd_step(args) -> int:
+    mgr, _, _ = _setup()
+    options = {}
+    if args.command == "host-collision":
+        options = {"hosts": args.hosts, "ips": args.ips}
+    elif args.command == "subdomain-brute":
+        options = {"domain": args.domain, "labels": args.labels, "wordlist": args.wordlist,
+                   "verify_http": args.verify_http}
+    method = {"analyze": "execute_analyze", "host-collision": "execute_host_collision",
+              "subdomain-brute": "execute_subdomain_brute"}[args.command]
+    try:
+        run = getattr(mgr, method)(args.run_id, **options)
+    except (ValueError, RuntimeError) as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 1
+    name = {"analyze": "asset_analysis", "host-collision": "host_collision", "subdomain-brute": "subdomain_brute"}[args.command]
+    step = next((s for s in reversed(run.steps) if s.name == name), None)
+    print(json.dumps({"run_id": run.id, "status": run.status,
+                      "step": step.__dict__ if step else None}, ensure_ascii=False))
+    return 0 if step and step.status in {"done", "skipped"} else 1
 
 
 def cmd_config(args) -> int:
@@ -214,7 +223,32 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("httpx", help="对已有 Run 执行主动 httpx 探活")
     p.add_argument("run_id")
+    p.add_argument("--favicon", action="store_true", help="显式Python受控favicon采集，需主动开关与预算")
+    p.add_argument("--jarm", action="store_true", help="显式Python受控JARM采集，需主动开关与握手预算")
     p.set_defaults(func=cmd_httpx)
+
+    p = sub.add_parser("analyze", help="仅分析当前Run证据，不联网")
+    p.add_argument("run_id")
+    p.set_defaults(func=cmd_step)
+
+    p = sub.add_parser("host-collision", help="主动Host候选验证；默认关闭，需域名和IP双重授权及预算")
+    p.add_argument("run_id")
+    p.add_argument("--hosts", nargs="+", default=None)
+    p.add_argument("--ips", nargs="+", default=None)
+    p.set_defaults(func=cmd_step)
+
+    p = sub.add_parser("subdomain-brute", help="主动DNS枚举；默认关闭，逐候选授权并限制预算")
+    p.add_argument("run_id")
+    p.add_argument("domain")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--labels", nargs="+")
+    group.add_argument("--wordlist", help="显式提供本地UTF-8小字典")
+    p.add_argument("--verify-http", action="store_true")
+    p.set_defaults(func=cmd_step)
+
+    p = sub.add_parser("export-signals", help="离线导出当前Run的七类信号")
+    p.add_argument("run_id")
+    p.set_defaults(func=cmd_export_signals)
 
     p = sub.add_parser("scope-check", help="检查目标是否在授权范围内")
     p.add_argument("target")
@@ -234,8 +268,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--limit", type=int, default=10)
     p.set_defaults(func=cmd_runs)
 
-    p = sub.add_parser("export-report", help="导出报告")
-    p.add_argument("--run-id", default=None)
+    p = sub.add_parser("export-report", help="离线导出单个Run报告")
+    p.add_argument("--run-id", required=True)
     p.add_argument("--format", choices=["json", "markdown"], default="json")
     p.set_defaults(func=cmd_export_report)
 

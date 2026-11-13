@@ -14,6 +14,25 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 import ipaddress
+import sqlite3
+from contextlib import contextmanager
+from functools import wraps
+
+from assetops.storage.queries import load_run_assets, reserve_active_budget
+
+
+def _exclusive_run(method):
+    @wraps(method)
+    def wrapped(self, run_id, *args, **kwargs):
+        try:
+            self._db.execute("INSERT INTO active_run_locks(run_id) VALUES (?)", (run_id,))
+        except sqlite3.IntegrityError as exc:
+            raise RuntimeError("Run not found or another operation is active; stale locks require operator review") from exc
+        try:
+            return method(self, run_id, *args, **kwargs)
+        finally:
+            self._db.execute("DELETE FROM active_run_locks WHERE run_id=?", (run_id,))
+    return wrapped
 
 from assetops.active.httpx_probe import probe_targets
 
@@ -187,7 +206,8 @@ class RunManager:
             update_run(self._db, run)
             raise
 
-    def execute_httpx(self, run_id: str) -> Run:
+    @_exclusive_run
+    def execute_httpx(self, run_id: str, *, favicon: bool = False, jarm: bool = False) -> Run:
         """对已有 Run 的资产执行独立主动探活；默认不由 execute 调用。"""
         run = get_run(self._db, run_id)
         if run is None:
@@ -199,18 +219,35 @@ class RunManager:
         run.add_step(step)
         update_run(self._db, run)
         try:
-            from assetops.storage.queries import list_assets
-            assets = list_assets(self._db, run_id=run.id, limit=run.budget_max)
+            assets = load_run_assets(self._db, run.id)
+            for asset in assets:
+                inputs = [o.evidence for o in asset.observations if o.source != "analysis"]
+                for field in ("host", "ip", "port"):
+                    values = [row[field] for row in inputs if row.get(field)]
+                    setattr(asset, field, str(values[-1]) if values else "")
             targets = [self._asset_probe_target(a) for a in assets if a.host]
             if not self._config.httpx_enabled:
                 step.status = "skipped"
                 step.summary = "httpx disabled by configuration"
                 return self._finish_active_step(run, step)
+            if favicon or jarm:
+                return self._execute_fingerprints(run, step, assets, favicon=favicon, jarm=jarm)
             if not self._config.httpx_path:
                 step.status = "skipped"
                 step.summary = "httpx path not configured"
                 return self._finish_active_step(run, step)
 
+            targets = [target for target in targets if self._scope.check(target, resolve_dns=False)[0]]
+            budget_row = self._db.fetch_one("SELECT used FROM active_budgets WHERE run_id=?", (run.id,))
+            remaining = max(run.budget_max - (budget_row["used"] if budget_row else 0), 0)
+            limit = min(remaining, self._config.active_max_requests, self._config.httpx_max_targets)
+            step.limited = len(targets) > limit
+            targets = targets[:limit]
+            if not targets:
+                step.status = "skipped"
+                step.summary = "no authorized targets or active budget exhausted"
+                return self._finish_active_step(run, step)
+            self._consume_active(run, step, len(targets))
             summary = probe_targets(
                 targets, scope_guard=self._scope, executable=self._config.httpx_path,
                 timeout=run.timeout, max_targets=self._config.httpx_max_targets,
@@ -246,11 +283,200 @@ class RunManager:
             run.total_observations += inserted
             step.status = "done"
             step.summary = f"probed {len(summary.results)} responses, appended {inserted} observations"
+            self._refresh_relations(run.id)
             return self._finish_active_step(run, step)
         except Exception as exc:
             step.status = "failed"
             step.error = f"{type(exc).__name__}: {exc}"
             return self._finish_active_step(run, step)
+
+    def _execute_fingerprints(self, run: Run, step: RunStep, assets: list[Asset], *, favicon: bool, jarm: bool) -> Run:
+        from assetops.active.fingerprints import collect_favicon
+        transport = self._active_transport(run, step)
+        errors, inserted = [], 0
+        step.limited = len(assets) > self._config.httpx_max_targets
+        for asset in assets[:self._config.httpx_max_targets]:
+            host = asset.host
+            if not host or not self._scope.check_domain(host)[0]:
+                continue
+            port = int(asset.port or 443)
+            scheme = "https" if port in {443, 8443} else "http"
+            target = f"{scheme}://{host}:{port}"
+            collectors = []
+            if favicon:
+                collectors.append(("favicon", lambda: collect_favicon(target, scope_guard=self._scope,
+                    transport=transport, max_bytes=min(self._config.active_max_response_bytes, 262144))))
+            if jarm:
+                from assetops.active.jarm import collect_jarm
+                collectors.append(("jarm", lambda: collect_jarm(f"https://{host}:{port}", scope_guard=self._scope,
+                    consume=lambda: self._consume_active(run, step),
+                    timeout=self._config.active_timeout, rate_limit=self._config.active_rate_limit)))
+            for source, collect in collectors:
+                try:
+                    evidence = collect()
+                    if evidence.get("error"):
+                        errors.append(str(evidence["error"]))
+                    evidence = {"host": host, "port": port, **evidence}
+                    insert_observation(self._db, run.id, Observation(run_id=run.id, source=source,
+                        confidence="medium", evidence=evidence), asset.id)
+                    run.total_observations += 1
+                    inserted += 1
+                    if evidence.get("status") in {"stopped", "unsupported", "failed"}:
+                        errors.append(f"{source}: {evidence.get('status')}")
+                        if evidence.get("status") == "stopped":
+                            raise RuntimeError("active step stopped after HTTP 429/503")
+                except Exception as exc:
+                    errors.append(f"{type(exc).__name__}: {exc}")
+                    step.status = "failed"
+                    step.error = "; ".join(errors)[:2000]
+                    step.summary = f"preserved {inserted} fingerprint observations"
+                    self._refresh_relations(run.id)
+                    return self._finish_active_step(run, step)
+        step.status = "failed" if errors else "done"
+        step.error = "; ".join(errors)[:2000]
+        step.summary = f"collected {inserted} fingerprint observations"
+        self._refresh_relations(run.id)
+        return self._finish_active_step(run, step)
+
+    def _active_transport(self, run: Run, step: RunStep):
+        from assetops.active.transport import ControlledTransport
+        return ControlledTransport(
+            self._scope, consume=lambda: self._consume_active(run, step),
+            rate_limit=self._config.active_rate_limit, timeout=self._config.active_timeout,
+            max_response_bytes=self._config.active_max_response_bytes,
+            max_requests=self._config.active_max_requests,
+        )
+
+    @contextmanager
+    def _module_step(self, run_id: str, name: str, enabled: bool):
+        run = get_run(self._db, run_id)
+        if run is None:
+            raise ValueError(f"Run not found: {run_id}")
+        if run.status not in {"completed", "failed"}:
+            raise RuntimeError("Run must be completed or failed")
+        step = RunStep(name=name, status="running", started_at=_now_iso())
+        run.add_step(step)
+        update_run(self._db, run)
+        try:
+            if not enabled:
+                step.status = "skipped"
+                step.summary = f"{name} disabled by configuration"
+            yield run, step
+        except Exception as exc:
+            step.status = "failed"
+            step.error = f"{type(exc).__name__}: {exc}"
+        finally:
+            self._finish_active_step(run, step)
+
+    def _store_module_results(self, run: Run, step: RunStep, source: str, summary: dict) -> None:
+        from assetops.models.asset import make_primary_key
+        inserted = 0
+        for row in summary["results"]:
+            if row.get("classification", "").endswith("baseline"):
+                continue
+            host = row.get("host", "")
+            ip = row.get("connect_ip") or next(iter(row.get("addresses", [])), "")
+            port = str(row.get("port", ""))
+            asset = Asset(host=host, ip=ip, port=port, domain=run.target,
+                          primary_key=make_primary_key(ip, port, host), sources={source})
+            if not asset.primary_key:
+                continue
+            asset.id = upsert_asset(self._db, asset)
+            insert_observation(self._db, run.id, Observation(run_id=run.id, source=source,
+                               confidence="low", evidence=row), asset.id)
+            inserted += 1
+        run.total_observations += inserted
+        from assetops.storage.queries import count_assets
+        run.total_assets = count_assets(self._db, run_id=run.id)
+        step.limited = bool(summary.get("limited"))
+        step.status = "failed" if summary.get("errors") else "done"
+        step.error = "; ".join(str(e.get("error", "")) for e in summary.get("errors", []))[:2000]
+        step.summary = f"{summary['summary']}; observations={inserted}; limited={step.limited}"
+        self._refresh_relations(run.id)
+
+    @_exclusive_run
+    def execute_host_collision(self, run_id: str, *, hosts=None, ips=None) -> Run:
+        from assetops.active.host_collision import run_host_collision
+        with self._module_step(run_id, "host_collision", self._config.host_collision_enabled) as (run, step):
+            if step.status != "skipped":
+                assets = load_run_assets(self._db, run_id)
+                known_hosts = {a.host for a in assets if a.host}
+                known_ips = {a.ip for a in assets if a.ip}
+                for asset in assets:
+                    for obs in asset.observations:
+                        if obs.evidence.get("host"):
+                            known_hosts.add(obs.evidence["host"])
+                selected_hosts = known_hosts if hosts is None else set(hosts)
+                selected_ips = known_ips if ips is None else set(ips)
+                if not selected_hosts <= known_hosts or not selected_ips <= known_ips:
+                    raise ValueError("collision candidates must be a subset of current Run assets")
+                summary = run_host_collision(self._scope, sorted(selected_ips), sorted(selected_hosts),
+                    transport=self._active_transport(run, step), max_candidates=self._config.active_max_requests)
+                self._store_module_results(run, step, "host_collision", summary)
+        return get_run(self._db, run_id)
+
+    @_exclusive_run
+    def execute_subdomain_brute(self, run_id: str, *, domain: str, labels=None, wordlist=None, verify_http=False) -> Run:
+        from assetops.active.subdomain_brute import run_subdomain_brute
+        with self._module_step(run_id, "subdomain_brute", self._config.subdomain_brute_enabled) as (run, step):
+            if step.status != "skipped":
+                summary = run_subdomain_brute(self._scope, domain, labels=labels, wordlist_path=wordlist,
+                    verify_http=verify_http, transport=self._active_transport(run, step),
+                    consume=lambda: self._consume_active(run, step),
+                    max_candidates=self._config.active_max_requests,
+                    max_requests=self._config.active_max_requests, rate_limit=self._config.active_rate_limit)
+                self._store_module_results(run, step, "subdomain_brute", summary)
+        return get_run(self._db, run_id)
+
+    def _consume_active(self, run: Run, step: RunStep, amount: int = 1) -> None:
+        from assetops.active.transport import BudgetExceeded
+        if step.active_reserved + amount > self._config.active_max_requests:
+            step.limited = True
+            raise BudgetExceeded("active step budget exhausted")
+        try:
+            reserve_active_budget(self._db, run.id, amount)
+        except RuntimeError as exc:
+            step.limited = True
+            raise BudgetExceeded(str(exc)) from exc
+        step.active_reserved += amount
+        step.active_used += amount
+        update_run(self._db, run)
+
+    def _refresh_relations(self, run_id: str) -> None:
+        assets = load_run_assets(self._db, run_id)
+        for asset in assets:
+            asset.ip = ""
+        for relation in derive_relations(assets):
+            upsert_relation(self._db, relation)
+
+    @_exclusive_run
+    def execute_analyze(self, run_id: str) -> Run:
+        from assetops.analysis.scoring import score_asset
+        run = get_run(self._db, run_id)
+        if run is None:
+            raise ValueError(f"Run not found: {run_id}")
+        if run.status not in {"completed", "failed"}:
+            raise RuntimeError("Run must be completed or failed")
+        step = RunStep(name="asset_analysis", status="running", started_at=_now_iso())
+        run.add_step(step)
+        update_run(self._db, run)
+        try:
+            inserted = 0
+            for asset in load_run_assets(self._db, run_id):
+                evidence = score_asset(asset, run_id)
+                if any(o.source == "analysis" and o.evidence == evidence for o in asset.observations):
+                    continue
+                obs = Observation(run_id=run_id, source="analysis", confidence="low", evidence=evidence)
+                insert_observation(self._db, run_id, obs, asset.id)
+                self._db.execute("UPDATE assets SET priority=? WHERE id=?", (evidence["priority"], asset.id))
+                inserted += 1
+            run.total_observations += inserted
+            step.status = "done"
+            step.summary = f"scored {inserted} assets (yingzhao-v1; theoretical 100, rule ceiling 97)"
+        except Exception as exc:
+            step.status = "failed"
+            step.error = f"{type(exc).__name__}: {exc}"
+        return self._finish_active_step(run, step)
 
     @staticmethod
     def _asset_probe_target(asset: Asset) -> str:
@@ -278,7 +504,7 @@ class RunManager:
     def _finish_active_step(self, run: Run, step: RunStep) -> Run:
         step.finished_at = _now_iso()
         if step.status == "failed" and run.status == "completed":
-            run.notes = f"{run.notes}\n[active_httpx failure] {step.error}".strip()
+            run.notes = f"{run.notes}\n[{step.name} failure] {step.error}".strip()
             run.transition_to("failed")
         update_run(self._db, run)
         return run

@@ -8,6 +8,10 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
+from urllib.parse import urlsplit
+import ipaddress
+
+from assetops.active.fingerprints import normalize_fingerprints
 
 from assetops.core.scope_guard import ScopeGuard
 
@@ -35,10 +39,9 @@ class HttpxProbeSummary:
     error: str = ""
 
 
-_ALLOWED_FLAGS = ("-json", "-duc", "-silent", "-timeout", "-retries", "-threads")
 _EVIDENCE_FIELDS = (
     "input", "status_code", "url", "title", "webserver", "server", "a", "ip",
-    "asn", "cname", "tech", "favicon_hash", "jarm", "content_type", "method",
+    "asn", "cname", "tech", "content_type", "method",
     "words", "lines", "content_length", "time",
 )
 _SENSITIVE_FIELDS = {"body", "response", "request", "headers", "header", "raw_response", "raw_request"}
@@ -116,6 +119,7 @@ def _normalize_httpx_evidence(row: dict) -> dict:
         if value is not None:
             evidence[field] = value
 
+    evidence.update(normalize_fingerprints(row))
     serialized = json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
     if len(serialized.encode("utf-8")) <= _MAX_EVIDENCE_BYTES:
         return evidence
@@ -133,6 +137,37 @@ def _format_target(host: str, port: str) -> str:
     return f"{host}:{port}" if port else host
 
 
+def _endpoint(value: str) -> tuple[str, str, int]:
+    if not value or any(c.isspace() for c in value) or value.startswith("-"):
+        raise ValueError("invalid target")
+    parsed = urlsplit(value if "://" in value else "//" + value)
+    if not parsed.hostname or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+        raise ValueError("invalid endpoint")
+    port = parsed.port
+    scheme = parsed.scheme or ("https" if port in (443, 8443) else "http")
+    if scheme not in ("http", "https"):
+        raise ValueError("unsupported scheme")
+    return scheme, parsed.hostname.lower().rstrip("."), port or (443 if scheme == "https" else 80)
+
+
+def _validate_output_addresses(row: dict, host: str, scope_guard: ScopeGuard) -> None:
+    addresses = []
+    for field in ("a", "ip", "host_ip"):
+        value = row.get(field)
+        if isinstance(value, (str, list)):
+            addresses.extend(value if isinstance(value, list) else [value])
+    for value in addresses:
+        address = ipaddress.ip_address(value)
+        try:
+            literal = ipaddress.ip_address(host)
+        except ValueError:
+            scope_guard.assert_active_address(host, str(address))
+        else:
+            if address != literal:
+                raise ValueError("output address differs from literal input")
+            scope_guard.assert_in_scope(str(address), resolve_dns=False)
+
+
 def probe_targets(
     targets: Sequence[str],
     *,
@@ -142,18 +177,22 @@ def probe_targets(
     max_targets: int = 100,
     output_limit: int = 100,
     extra_args: Sequence[str] = (),
+    favicon: bool = False,
+    jarm: bool = False,
     run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
 ) -> HttpxProbeSummary:
     """执行一次有界 httpx；调用方必须显式传入 enabled 之外的执行意图。"""
-    if max_targets < 1 or output_limit < 1:
+    if type(favicon) is not bool or type(jarm) is not bool:
+        raise TypeError("favicon and jarm must be bool")
+    if favicon or jarm:
+        return HttpxProbeSummary([], error="unsupported: external httpx fingerprint requests, DNS and handshake budgets cannot be guaranteed; use controlled favicon transport; JARM collection unavailable")
+    if max_targets < 1 or output_limit < 1 or timeout < 1:
         raise ValueError("limits must be positive")
     executable_path = Path(executable)
     if not executable_path.is_absolute():
         raise HttpxProbeError("httpx executable must be an absolute path")
-    allowed = set(_ALLOWED_FLAGS)
-    for arg in extra_args:
-        if not arg or arg.split("=", 1)[0] not in allowed:
-            raise HttpxProbeError(f"unsupported httpx argument: {arg}")
+    if extra_args:
+        raise HttpxProbeError("unsupported httpx arguments: arbitrary extra_args are not allowed")
     checked: list[str] = []
     skipped = 0
     for target in targets:
@@ -161,15 +200,19 @@ def probe_targets(
             skipped += 1
             continue
         try:
-            scope_guard.assert_in_scope(target)
-        except PermissionError:
+            _endpoint(target)
+            scope_guard.assert_in_scope(target, resolve_dns=False)
+        except (ValueError, PermissionError):
             skipped += 1
             continue
         checked.append(target)
     if not checked:
         return HttpxProbeSummary([], skipped=skipped)
 
-    command = [str(executable_path), "-json", "-duc", "-silent", *extra_args, *checked]
+    command = [str(executable_path), "-json", "-duc", "-silent", "-tech-detect",
+               "-status-code", "-title", "-server",
+               "-timeout", str(min(timeout, 10)), "-retries", "0", "-threads", "1",
+               "-rate-limit", "2", "-no-fallback", *checked]
     try:
         completed = run(
             command, shell=False, capture_output=True, text=True,
@@ -191,6 +234,20 @@ def probe_targets(
     for row in rows:
         evidence = _normalize_httpx_evidence(row)
         target = str(evidence.get("input") or evidence.get("url") or "")
+        try:
+            key = _endpoint(target)
+            if key not in {_endpoint(value) for value in checked}:
+                raise ValueError("output does not match fixed input")
+            output_url = evidence.get("url")
+            if output_url and _endpoint(output_url) != key:
+                raise ValueError("output URL does not match input")
+            for value in (target, output_url):
+                if value:
+                    scope_guard.assert_in_scope(value, resolve_dns=False)
+            _validate_output_addresses(row, key[1], scope_guard)
+        except (ValueError, TypeError, PermissionError):
+            skipped += 1
+            continue
         status_code = evidence.get("status_code")
         results.append(HttpxProbeResult(
             target=target,

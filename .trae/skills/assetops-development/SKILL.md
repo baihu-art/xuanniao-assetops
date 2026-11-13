@@ -49,8 +49,11 @@ description: Develop and maintain the 玄鸟 AssetOps authorized asset-discovery
 
 - Provider 缺凭据应是 `skipped`；API 或网络失败不能伪装成成功的 `fetched 0 assets`。
 - 保留失败原因和部分完成状态；不要在统一收尾逻辑中覆盖 skipped/failed 的摘要。
-- `budget_max`、取消、恢复和 Run 过滤必须在实际实现前明确测试边界。
-- 报告按 Run 过滤，Markdown 表格内容需转义；报告和归档使用原子写入。
+- `budget_max`、取消、恢复和 Run 过滤必须在实际实现前明确测试边界；主动步骤默认关闭，只有显式授权才可执行。
+- 报告按 Run 过滤，Markdown 表格内容需转义；报告和归档使用原子写入。`signals` 使用 schema_version/run_id/kind/status/data/warnings，data固定为assets或results；导出路径为 data_root/runs/{run_id}/signals，禁止正文、密钥和跨Run数据。
+- 新模块包括 `assetops/analysis/scoring.py`、`assetops/analysis/signals.py` 和 `assetops/active/` 的受控传输、碰撞、枚举与指纹采集。评分仅使用当前Run观测，yingzhao-v1理论满分100、实际最高97；分析观察使用source=analysis。
+- 主动开关 `ASSETOPS_HOST_COLLISION_ENABLED` / `ASSETOPS_SUBDOMAIN_BRUTE_ENABLED` 及 `ASSETOPS_ACTIVE_*` 限额需配置校验；请求前预留持久化预算，基线和TLS握手也计入，不因重复调用重置。
+- CLI 命令包括 `analyze`、`host-collision`、`subdomain-brute`、`export-signals`；MCP工具为 `analyze`、`host_collision`、`subdomain_brute`、`export_signals`。analyze不联网；httpx的favicon/jarm必须显式布尔开启；碰撞要求域名与IP双重授权；子域只接受显式小字典/标签。
 - CLI 参数必须真正传给 `create_run`；MCP 工具命名不得覆盖导入的存储查询函数，Provider 不应向 stdout 打印污染 stdio 协议。
 
 ## 验证流程

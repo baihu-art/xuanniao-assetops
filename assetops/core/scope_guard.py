@@ -167,6 +167,55 @@ class ScopeGuard:
 
         return False, f"'{hostname}' does not match any authorized target"
 
+    def check_domain(self, hostname: str) -> tuple[bool, str]:
+        """Check explicit domain authorization without DNS or IP fallback."""
+        hostname = hostname.lower().rstrip(".")
+        if not hostname or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-." for c in hostname):
+            return False, "invalid domain name"
+        if len(hostname) > 253 or any(
+            not label or len(label) > 63 or label.startswith("-") or label.endswith("-")
+            for label in hostname.split(".")
+        ):
+            return False, "invalid domain name"
+        try:
+            ipaddress.ip_address(hostname)
+            return False, "domain authorization requires a domain, not an IP"
+        except ValueError:
+            pass
+        for pattern in self._rules.out_of_scope_domains:
+            if TargetScope._domain_match(hostname, pattern.lower().rstrip(".")):
+                return False, "domain matches out_of_scope pattern"
+        if any(TargetScope._domain_match(hostname, pattern.lower().rstrip("."))
+               for target in self._targets for pattern in target.domains):
+            return True, "explicit domain authorization"
+        return False, "domain does not match explicit authorization"
+
+    def check_ip(self, address: str) -> tuple[bool, str]:
+        """Check literal IP/CIDR authorization, never resolving names."""
+        try:
+            address = str(ipaddress.ip_address(address))
+        except ValueError:
+            return False, "not a literal IP address"
+        for pattern in self._rules.out_of_scope_domains:
+            if TargetScope._domain_match(address, pattern):
+                return False, "IP matches out_of_scope pattern"
+        if any(target.ip_matches(address, resolve_dns=False) for target in self._targets):
+            return True, "explicit IP/CIDR authorization"
+        return False, "IP does not match explicit IP/CIDR authorization"
+
+    def assert_active_address(self, hostname: str, address: str, *, collision: bool = False) -> None:
+        allowed, reason = self.check_domain(hostname)
+        if not allowed:
+            raise PermissionError(reason)
+        addr = ipaddress.ip_address(address)
+        explicit, reason = self.check_ip(str(addr))
+        restricted = any(t.ips or t.cidrs for t in self._targets)
+        if (collision or restricted or not addr.is_global or addr.is_multicast) and not explicit:
+            raise PermissionError(f"connection IP requires explicit authorization: {reason}")
+        allowed, reason = self.check(f"http://{hostname}/", resolve_dns=False)
+        if not allowed:
+            raise PermissionError(reason)
+
     def assert_in_scope(self, target: str, *, resolve_dns: bool = True) -> None:
         ok, reason = self.check(target, resolve_dns=resolve_dns)
         if not ok:

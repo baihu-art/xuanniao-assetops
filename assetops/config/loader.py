@@ -36,6 +36,17 @@ class AssetOpsConfig:
     httpx_path: str = ""
     httpx_max_targets: int = 100
     httpx_output_limit: int = 100
+    host_collision_enabled: bool = False
+    subdomain_brute_enabled: bool = False
+    active_rate_limit: int = 2
+    active_max_requests: int = 100
+    active_timeout: int = 10
+    active_max_response_bytes: int = 262144
+
+    def __post_init__(self) -> None:
+        for name in ("active_rate_limit", "active_max_requests", "active_timeout", "active_max_response_bytes"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive")
 
     _fofa_email: str = ""
     _fofa_key: str = ""
@@ -73,6 +84,12 @@ class AssetOpsConfig:
             httpx_path=os.environ.get("ASSETOPS_HTTPX_PATH", "").strip(),
             httpx_max_targets=_int_env("ASSETOPS_HTTPX_MAX_TARGETS", 100),
             httpx_output_limit=_int_env("ASSETOPS_HTTPX_OUTPUT_LIMIT", 100),
+            host_collision_enabled=_bool_env("ASSETOPS_HOST_COLLISION_ENABLED"),
+            subdomain_brute_enabled=_bool_env("ASSETOPS_SUBDOMAIN_BRUTE_ENABLED"),
+            active_rate_limit=_int_env("ASSETOPS_ACTIVE_RATE_LIMIT", 2),
+            active_max_requests=_int_env("ASSETOPS_ACTIVE_MAX_REQUESTS", 100),
+            active_timeout=_int_env("ASSETOPS_ACTIVE_TIMEOUT", 10),
+            active_max_response_bytes=_int_env("ASSETOPS_ACTIVE_MAX_RESPONSE_BYTES", 262144),
             _fofa_email=os.environ.get("FOFA_EMAIL", "").strip(),
             _fofa_key=os.environ.get("FOFA_KEY", "").strip(),
             _quake_token=os.environ.get("QUAKE_TOKEN", "").strip(),
@@ -112,6 +129,12 @@ class AssetOpsConfig:
             "rate_limit": self.rate_limit,
             "budget_max": self.budget_max,
             "insecure_tls": self.insecure_tls,
+            "host_collision_enabled": self.host_collision_enabled,
+            "subdomain_brute_enabled": self.subdomain_brute_enabled,
+            "active_rate_limit": self.active_rate_limit,
+            "active_max_requests": self.active_max_requests,
+            "active_timeout": self.active_timeout,
+            "active_max_response_bytes": self.active_max_response_bytes,
             "httpx_enabled": self.httpx_enabled,
             "httpx_path_configured": bool(self.httpx_path),
             "httpx_max_targets": self.httpx_max_targets,

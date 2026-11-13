@@ -9,7 +9,7 @@ from assetops.storage import ArchiveStore, Database, list_assets
 
 
 def _scope():
-    return ScopeGuard([TargetScope(name="ok", domains=["*.example.com"])], ScopeRules())
+    return ScopeGuard([TargetScope(name="ok", domains=["*.example.com"], ips=["192.0.2.10"])], ScopeRules())
 
 
 def test_httpx_probe_uses_safe_command_and_parses_jsonl(tmp_path):

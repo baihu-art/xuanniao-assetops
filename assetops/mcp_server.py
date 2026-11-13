@@ -5,11 +5,7 @@
 
 from __future__ import annotations
 
-import json
-import os
 import sys
-import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
 
 try:
@@ -37,20 +33,10 @@ _scope: ScopeGuard | None = None
 _run_manager: RunManager | None = None
 
 
-def _atomic_write(path: Path, content: str) -> None:
-    fd, temp_path = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, path)
-    except BaseException:
-        try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
-        raise
+def _step_result(run, name: str) -> dict:
+    step = next((s for s in reversed(run.steps) if s.name == name), None)
+    return {"run_id": run.id, "status": run.status,
+            "step": step.__dict__ if step else None}
 
 
 def _ensure() -> RunManager:
@@ -86,12 +72,41 @@ if mcp is not None:
                 "target": run.target, "scope_loaded": mgr._scope.is_configured}
 
     @mcp.tool()
-    def active_httpx(run_id: str) -> dict:
+    def active_httpx(run_id: str, favicon: bool = False, jarm: bool = False) -> dict:
+        """主动步骤默认关闭，须显式授权和预算。普通探活需外部httpx路径；favicon/JARM为Python受控指纹采集、不含普通探活。"""
         mgr = _ensure()
-        run = mgr.execute_httpx(run_id)
+        run = mgr.execute_httpx(run_id, favicon=favicon, jarm=jarm)
         step = next((s for s in run.steps if s.name == "active_httpx"), None)
         return {"run_id": run.id, "status": run.status,
                 "step": step.__dict__ if step else None}
+
+    @mcp.tool()
+    def analyze(run_id: str) -> dict:
+        """仅用当前Run观测进行五维评分，不联网，不证明漏洞。"""
+        run = _ensure().execute_analyze(run_id)
+        return _step_result(run, "asset_analysis")
+
+    @mcp.tool()
+    def host_collision(run_id: str, hosts: list[str] | None = None,
+                       ips: list[str] | None = None) -> dict:
+        """主动Host候选验证，默认关闭；须域名与连接IP双重授权，受持久化预算限额约束。"""
+        run = _ensure().execute_host_collision(run_id, hosts=hosts, ips=ips)
+        return _step_result(run, "host_collision")
+
+    @mcp.tool()
+    def subdomain_brute(run_id: str, domain: str, labels: list[str] | None = None,
+                        wordlist: str | None = None, verify_http: bool = False) -> dict:
+        """主动DNS枚举，默认关闭；显式提供标签或本地小字典，逐候选授权、限额；HTTP验证另需显式开启。"""
+        run = _ensure().execute_subdomain_brute(run_id, domain=domain, labels=labels,
+                                               wordlist=wordlist, verify_http=verify_http)
+        return _step_result(run, "subdomain_brute")
+
+    @mcp.tool()
+    def export_signals(run_id: str) -> dict:
+        """离线原子导出该Run的七类结构化信号；不触发探测，不导出正文或密钥。"""
+        from assetops.analysis.signals import export_signals as write_signals
+        mgr = _ensure()
+        return write_signals(mgr._db, _config.data_root, run_id)
 
     @mcp.tool()
     def check_scope(target: str) -> dict:
@@ -155,41 +170,14 @@ if mcp is not None:
             return {"runs": [r.to_dict() for r in runs], "count": len(runs)}
 
     @mcp.tool()
-    def export_report(run_id: str | None = None, format: str = "json") -> dict:
+    def export_report(run_id: str, format: str = "json") -> dict:
+        """离线导出单个Run报告，含五维评分、指纹和候选状态。"""
+        from assetops.analysis.signals import export_report as write_report
         mgr = _ensure()
-        if format not in {"json", "markdown"}:
-            return {"error": f"unsupported format: {format}"}
-        if run_id and get_run(_db, run_id) is None:
-            return {"error": f"Run {run_id} not found"}
-        report_dir = Path(_config.data_root) / "reports"
-        report_dir.mkdir(parents=True, exist_ok=True)
-        assets = query_assets(_db, run_id=run_id, limit=50000)
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-
-        if format == "json":
-            path = report_dir / f"report-{ts}.json"
-            _atomic_write(path, json.dumps({
-                "run_id": run_id, "generated_at": ts,
-                "total_assets": len(assets), "assets": [a.to_dict() for a in assets],
-            }, ensure_ascii=False, indent=2) + "\n")
-        elif format == "markdown":
-            path = report_dir / f"report-{ts}.md"
-            lines = [
-                "# 玄鸟 AssetOps 资产报告", "",
-                f"- 生成时间：{ts}", f"- Run ID：{run_id or '(全部)'}",
-                f"- 资产总数：{len(assets)}", "",
-                "## 资产列表", "",
-                "| 优先级 | Host | IP:Port | 标题 | Server | 来源 |",
-                "|--------|------|---------|------|--------|------|",
-            ]
-            for a in sorted(assets, key=lambda x: (x.priority != "high", x.host)):
-                sources = ", ".join(sorted(a.sources))
-                values = [a.priority, a.host, f"{a.ip}:{a.port}", a.title, a.server, sources]
-                escaped = [str(value).replace("|", "\\|").replace("\r", " ").replace("\n", " ") for value in values]
-                lines.append("| " + " | ".join(escaped) + " |")
-            _atomic_write(path, "\n".join(lines) + "\n")
-        return {"format": format, "path": str(path),
-                "asset_count": len(assets), "summary": f"报告已生成到 {path}"}
+        try:
+            return write_report(mgr._db, _config.data_root, run_id, format)
+        except ValueError as exc:
+            return {"error": str(exc)}
 
 
 def serve() -> None:

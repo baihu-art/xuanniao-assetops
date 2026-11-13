@@ -42,6 +42,9 @@ class RunStep:
     duration_seconds: float | None = None
     summary: str = ""
     error: str = ""
+    active_reserved: int = 0
+    active_used: int = 0
+    limited: bool = False
 
 
 @dataclass

@@ -113,7 +113,8 @@ class BaseProvider(ABC):
         asset.sources.add(self.name)
         obs = Observation(
             source=self.name, confidence=confidence,
-            evidence=evidence or {},
+            evidence={"host": host, "ip": ip, "port": port, "title": title,
+                      "webserver": server, **(evidence or {})},
         )
         asset.observations.append(obs)
         return asset
